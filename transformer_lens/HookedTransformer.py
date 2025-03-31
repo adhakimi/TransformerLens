@@ -1517,7 +1517,11 @@ class HookedTransformer(HookedRootModule):
                     "You are using MoE, so the layer norm weights can't be folded! Skipping"
                 )
             elif self.cfg.normalization_type in ["LN", "LNPre"]:
-                state_dict = self.fold_layer_norm(state_dict)
+                if "blocks.0.ln1.w" not in state_dict:#for non-parametric LN, e.g. OLMo
+                    #just center the weights
+                    state_dict = self.fold_layer_norm(state_dict, fold_biases=False, fold_weights=False)
+                else:
+                    state_dict = self.fold_layer_norm(state_dict)
             elif self.cfg.normalization_type in ["RMS", "RMSPre"]:
                 state_dict = self.fold_layer_norm(
                     state_dict, fold_biases=False, center_weights=False
@@ -1557,7 +1561,7 @@ class HookedTransformer(HookedRootModule):
         return loading.fill_missing_keys(self, state_dict)
 
     def fold_layer_norm(
-        self, state_dict: Dict[str, torch.Tensor], fold_biases=True, center_weights=True
+        self, state_dict: Dict[str, torch.Tensor], fold_biases=True, center_weights=True, fold_weights=True
     ):
         """Fold Layer Norm. Can also be used to fold RMS Norm, when fold_biases and center_weights are set to False.
 
@@ -1569,6 +1573,7 @@ class HookedTransformer(HookedRootModule):
             state_dict (Dict[str, torch.Tensor]): State dict of pretrained model.
             fold_biases (bool): Enables folding of LN biases. Should be disabled when RMS Norm is used.
             center_weights (bool): Enables the centering of weights after folding in LN. Should be disabled when RMS Norm is used.
+            fold_weights (bool): Enables folding of LN weights. Should be disabled when there are no such weights (i.e., in non-parametric LN)
         """
 
         # Models that use Grouped Query Attention (Only Mistral at the time of writing) prefix their K/V weights and
@@ -1605,18 +1610,19 @@ class HookedTransformer(HookedRootModule):
                 )
                 del state_dict[f"blocks.{l}.ln1.b"]
 
-            state_dict[f"blocks.{l}.attn.W_Q"] = (
-                state_dict[f"blocks.{l}.attn.W_Q"] * state_dict[f"blocks.{l}.ln1.w"][None, :, None]
-            )
-            state_dict[f"blocks.{l}.attn.{gqa}W_K"] = (
-                state_dict[f"blocks.{l}.attn.{gqa}W_K"]
-                * state_dict[f"blocks.{l}.ln1.w"][None, :, None]
-            )
-            state_dict[f"blocks.{l}.attn.{gqa}W_V"] = (
-                state_dict[f"blocks.{l}.attn.{gqa}W_V"]
-                * state_dict[f"blocks.{l}.ln1.w"][None, :, None]
-            )
-            del state_dict[f"blocks.{l}.ln1.w"]
+            if fold_weights: #whenever LN weights exist at all
+                state_dict[f"blocks.{l}.attn.W_Q"] = (
+                    state_dict[f"blocks.{l}.attn.W_Q"] * state_dict[f"blocks.{l}.ln1.w"][None, :, None]
+                )
+                state_dict[f"blocks.{l}.attn.{gqa}W_K"] = (
+                    state_dict[f"blocks.{l}.attn.{gqa}W_K"]
+                    * state_dict[f"blocks.{l}.ln1.w"][None, :, None]
+                )
+                state_dict[f"blocks.{l}.attn.{gqa}W_V"] = (
+                    state_dict[f"blocks.{l}.attn.{gqa}W_V"]
+                    * state_dict[f"blocks.{l}.ln1.w"][None, :, None]
+                )
+                del state_dict[f"blocks.{l}.ln1.w"]
 
             # Finally, we center the weights reading from the residual stream. The output of the
             # first part of the LayerNorm is mean 0 and standard deviation 1, so the mean of any
@@ -1649,17 +1655,18 @@ class HookedTransformer(HookedRootModule):
                     ).sum(-2)
                     del state_dict[f"blocks.{l}.ln2.b"]
 
-                state_dict[f"blocks.{l}.mlp.W_in"] = (
-                    state_dict[f"blocks.{l}.mlp.W_in"] * state_dict[f"blocks.{l}.ln2.w"][:, None]
-                )
-
-                if self.cfg.gated_mlp:
-                    state_dict[f"blocks.{l}.mlp.W_gate"] = (
-                        state_dict[f"blocks.{l}.mlp.W_gate"]
-                        * state_dict[f"blocks.{l}.ln2.w"][:, None]
+                if fold_weights: #whenever LN weights exist at all
+                    state_dict[f"blocks.{l}.mlp.W_in"] = (
+                        state_dict[f"blocks.{l}.mlp.W_in"] * state_dict[f"blocks.{l}.ln2.w"][:, None]
                     )
 
-                del state_dict[f"blocks.{l}.ln2.w"]
+                    if self.cfg.gated_mlp:
+                        state_dict[f"blocks.{l}.mlp.W_gate"] = (
+                            state_dict[f"blocks.{l}.mlp.W_gate"]
+                            * state_dict[f"blocks.{l}.ln2.w"][:, None]
+                        )
+
+                    del state_dict[f"blocks.{l}.ln2.w"]
 
                 if center_weights:
                     # Center the weights that read in from the LayerNormPre
@@ -1707,8 +1714,9 @@ class HookedTransformer(HookedRootModule):
             ).sum(dim=-2)
             del state_dict[f"ln_final.b"]
 
-        state_dict[f"unembed.W_U"] = state_dict[f"unembed.W_U"] * state_dict[f"ln_final.w"][:, None]
-        del state_dict[f"ln_final.w"]
+        if fold_weights:
+            state_dict[f"unembed.W_U"] = state_dict[f"unembed.W_U"] * state_dict[f"ln_final.w"][:, None]
+            del state_dict[f"ln_final.w"]
 
         if center_weights:
             # Center the weights that read in from the LayerNormPre
