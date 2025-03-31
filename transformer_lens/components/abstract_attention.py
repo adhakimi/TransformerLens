@@ -1,13 +1,12 @@
+import math
 from abc import ABC
 from typing import Dict, Optional, Tuple, Union
 
 import einops
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from better_abc import abstract_attribute
-from fancy_einsum import einsum
 from jaxtyping import Float, Int
 from transformers.utils import is_bitsandbytes_available
 
@@ -15,6 +14,7 @@ from transformer_lens.FactoredMatrix import FactoredMatrix
 from transformer_lens.hook_points import HookPoint
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
 from transformer_lens.past_key_value_caching import HookedTransformerKeyValueCacheEntry
+from transformer_lens.utilities.attention import complex_attn_linear, simple_attn_linear
 from transformer_lens.utils import get_offset_position_ids
 
 if is_bitsandbytes_available():
@@ -46,18 +46,24 @@ class AbstractAttention(ABC, nn.Module):
         self.cfg = HookedTransformerConfig.unwrap(cfg)
 
         if self.cfg.load_in_4bit:
-            nq = int((self.cfg.d_model * self.cfg.d_model) / 2)
+            nq = int((self.cfg.d_model * self.cfg.d_head * self.cfg.n_heads) / 2)
             self.W_Q = Params4bit(torch.empty(nq, 1, dtype=torch.uint8), requires_grad=False)
             self.W_O = Params4bit(torch.empty(nq, 1, dtype=torch.uint8), requires_grad=False)
         else:
             self.W_Q = nn.Parameter(
                 torch.empty(
-                    self.cfg.n_heads, self.cfg.d_model, self.cfg.d_head, dtype=self.cfg.dtype
+                    self.cfg.n_heads,
+                    self.cfg.d_model,
+                    self.cfg.d_head,
+                    dtype=self.cfg.dtype,
                 )
             )
             self.W_O = nn.Parameter(
                 torch.empty(
-                    self.cfg.n_heads, self.cfg.d_head, self.cfg.d_model, dtype=self.cfg.dtype
+                    self.cfg.n_heads,
+                    self.cfg.d_head,
+                    self.cfg.d_model,
+                    dtype=self.cfg.dtype,
                 )
             )
         self.W_K = abstract_attribute()
@@ -91,7 +97,7 @@ class AbstractAttention(ABC, nn.Module):
 
         # attn_scale is a constant that we divide the attention scores by pre-softmax. I'm not entirely sure why it matters, but it's probably a mix of softmax not being scale invariant and numerical stability?
         if self.cfg.use_attn_scale:
-            self.attn_scale = np.sqrt(self.cfg.d_head)
+            self.attn_scale = self.cfg.attn_scale  # Defaults to sqrt(d_head)
         else:
             self.attn_scale = 1.0
         if self.cfg.scale_attn_by_inverse_layer_idx:
@@ -223,8 +229,9 @@ class AbstractAttention(ABC, nn.Module):
                     self.cfg.n_heads, key_ctx, self.cfg.device
                 )
 
+            # Take the last query_ctx positions so it also works with past_kv_cache
             attn_scores += self.alibi[
-                :, :query_ctx, :key_ctx
+                :, -query_ctx:, :key_ctx
             ]  # [batch, head_index, query_pos, key_pos]
         elif self.cfg.positional_embedding_type == "relative_positional_bias":
             if position_bias is None:
@@ -258,49 +265,57 @@ class AbstractAttention(ABC, nn.Module):
         if not self.cfg.use_attn_result:
             if self.cfg.load_in_4bit:
                 # call bitsandbytes method to dequantize and multiply
-                out = bnb.matmul_4bit(
-                    z.reshape(z.shape[0], z.shape[1], self.cfg.d_model),
-                    self.W_O.t(),
-                    # bias=self.W_O.t(),
-                    bias=None,
-                    quant_state=self.W_O.quant_state,
-                )
-                +self.b_O
-            else:
                 out = (
-                    (
-                        einsum(
-                            "batch pos head_index d_head, \
-                                head_index d_head d_model -> \
-                                batch pos d_model",
-                            z,
-                            self.W_O,
-                        )
+                    bnb.matmul_4bit(
+                        z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
+                        self.W_O.t(),
+                        # bias=self.W_O.t(),
+                        bias=None,
+                        quant_state=self.W_O.quant_state,
                     )
                     + self.b_O
-                )  # [batch, pos, d_model]
+                )
+            else:
+                w = einops.rearrange(
+                    self.W_O, "head_index d_head d_model -> d_model (head_index d_head)"
+                )
+
+                if self.b_O.device != w.device:
+                    w = w.to(self.b_O.device)
+                if self.b_O.device != z.device:
+                    z = z.to(self.b_O.device)
+
+                out = F.linear(
+                    z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
+                    w,
+                    self.b_O,
+                )
         else:
             # Explicitly calculate the attention result so it can be accessed by a hook
             # This is off by default because it can easily eat through your GPU memory.
             if self.cfg.load_in_4bit:
                 result = self.hook_result(
                     bnb.matmul_4bit(
-                        z.reshape(z.shape[0], z.shape[1], self.cfg.d_model),
+                        z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
                         self.W_O.t(),
                         bias=None,
                         quant_state=self.W_O.quant_state,
                     )
                 )
             else:
-                result = self.hook_result(
-                    einsum(
-                        "batch pos head_index d_head, \
-                            head_index d_head d_model -> \
-                            batch pos head_index d_model",
-                        z,
-                        self.W_O,
-                    )
-                )  # [batch, pos, head_index, d_model]
+                # Add singleton dimensions to make shapes compatible for broadcasting:
+                w = einops.rearrange(
+                    self.W_O,
+                    "head_index d_head d_model -> 1 1 head_index d_head d_model",
+                )
+                z = einops.rearrange(
+                    z, "batch pos head_index d_head -> batch pos head_index d_head 1"
+                )
+
+                # Multiply the z tensor by the W_O tensor, summing over the d_head dimension
+                unhooked_result = (z * w).sum(-2)
+
+                result = self.hook_result(unhooked_result)  # [batch, pos, head_index, d_model]
             out = (
                 einops.reduce(result, "batch position index model->batch position model", "sum")
                 + self.b_O
@@ -326,11 +341,11 @@ class AbstractAttention(ABC, nn.Module):
         Float[torch.Tensor, "batch kv_pos head_index d_head"],
         Float[torch.Tensor, "batch kv_pos head_index d_head"],
     ]:
-        if self.cfg.use_split_qkv_input or self.cfg.use_attn_in:
-            qkv_einops_string = "batch pos head_index d_model"
-        else:
-            qkv_einops_string = "batch pos d_model"
-
+        attn_fn = (
+            complex_attn_linear
+            if self.cfg.use_split_qkv_input or self.cfg.use_attn_in
+            else simple_attn_linear
+        )
         if self.cfg.load_in_4bit:
             q = self.hook_q(
                 # call bitsandbytes method to dequantize and multiply
@@ -348,15 +363,7 @@ class AbstractAttention(ABC, nn.Module):
                 + self.b_Q
             )
         else:
-            q = self.hook_q(
-                einsum(
-                    f"{qkv_einops_string}, head_index d_model d_head \
-                    -> batch pos head_index d_head",
-                    query_input,
-                    self.W_Q,
-                )
-                + self.b_Q
-            )  # [batch, pos, head_index, d_head]
+            q = self.hook_q(attn_fn(query_input, self.W_Q, self.b_Q))
         if self.cfg.load_in_4bit:
             if not isinstance(self.W_K, Params4bit):
                 raise ValueError("W_K must be a Params4bit object if load_in_4bit is True")
@@ -373,15 +380,7 @@ class AbstractAttention(ABC, nn.Module):
                 + self.b_K
             )
         else:
-            k = self.hook_k(
-                einsum(
-                    f"{qkv_einops_string}, head_index d_model d_head \
-                    -> batch pos head_index d_head",
-                    key_input,
-                    self.W_K,
-                )
-                + self.b_K
-            )  # [batch, pos, head_index, d_head]
+            k = self.hook_k(attn_fn(key_input, self.W_K, self.b_K))
 
         if self.cfg.load_in_4bit:
             if not isinstance(self.W_V, Params4bit):
@@ -402,15 +401,8 @@ class AbstractAttention(ABC, nn.Module):
                 + self.b_V
             )
         else:
-            v = self.hook_v(
-                einsum(
-                    f"{qkv_einops_string}, head_index d_model d_head \
-                    -> batch pos head_index d_head",
-                    value_input,
-                    self.W_V,
-                )
-                + self.b_V
-            )  # [batch, pos, head_index, d_head]
+            v = self.hook_v(attn_fn(value_input, self.W_V, self.b_V))
+
         return q, k, v
 
     def calculate_attention_scores(
@@ -418,16 +410,17 @@ class AbstractAttention(ABC, nn.Module):
         q: Float[torch.Tensor, "batch query_pos head_index d_head"],
         k: Float[torch.Tensor, "batch key_pos head_index d_head"],
     ) -> Float[torch.Tensor, "batch head_index query_pos key_pos"]:
-        attn_scores = (
-            einsum(
-                "batch query_pos head_index d_head, \
-                    batch key_pos head_index d_head \
-                    -> batch head_index query_pos key_pos",
-                q,
-                k,
-            )
-            / self.attn_scale
+        q_ = einops.rearrange(
+            q, "batch query_pos head_index d_head -> batch head_index query_pos d_head"
         )
+        k_ = einops.rearrange(
+            k, "batch key_pos head_index d_head -> batch head_index d_head key_pos"
+        )
+        attn_scores = q_ @ k_ / self.attn_scale
+        if self.cfg.attn_scores_soft_cap > 0:
+            attn_scores = self.cfg.attn_scores_soft_cap * F.tanh(
+                attn_scores / self.cfg.attn_scores_soft_cap
+            )
         return attn_scores
 
     def calculate_z_scores(
@@ -435,13 +428,17 @@ class AbstractAttention(ABC, nn.Module):
         v: Float[torch.Tensor, "batch key_pos head_index d_head"],
         pattern: Float[torch.Tensor, "batch head_index query_pos key_pos"],
     ) -> Float[torch.Tensor, "batch query_pos head_index d_head"]:
+        v_ = einops.rearrange(
+            v, "batch key_pos head_index d_head -> batch head_index key_pos d_head"
+        )
+        pattern_ = einops.rearrange(
+            pattern,
+            "batch head_index query_pos key_pos -> batch head_index query_pos key_pos",
+        )
         z = self.hook_z(
-            einsum(
-                "batch key_pos head_index d_head, \
-                batch head_index query_pos key_pos -> \
-                batch query_pos head_index d_head",
-                v,
-                pattern,
+            einops.rearrange(
+                pattern_ @ v_,
+                "batch head_index query_pos d_head -> batch query_pos head_index d_head",
             )
         )
         return z
@@ -467,9 +464,16 @@ class AbstractAttention(ABC, nn.Module):
         final_mask = self.mask[None, None, -query_ctx_length:, -key_ctx_length:]  # [1, 1, pos, pos]
         if attention_mask is not None:
             # Apply a causal mask to the attention scores considering the padding
-            einsum_str = "batch head pos offset_pos, batch offset_pos -> batch head pos offset_pos"
+
+            # Add singleton dimensions to the attention mask to match the shape of the final mask
+            attention_mask = einops.rearrange(
+                attention_mask, "batch offset_pos -> batch 1 1 offset_pos"
+            )
+
             final_mask = final_mask.to(attention_mask.device)
-            final_mask = einops.einsum(final_mask, attention_mask, einsum_str).bool()
+
+            # Element-wise multiplication of the final mask and the attention mask and cast to boolean
+            final_mask = (final_mask * attention_mask).bool()  # [batch, head, pos, offset_pos]
 
         attn_scores = attn_scores.to(final_mask.device)
         return torch.where(final_mask, attn_scores, self.IGNORE)
@@ -491,8 +495,33 @@ class AbstractAttention(ABC, nn.Module):
         pos = torch.arange(n_ctx, dtype=high_precision)
         dim = torch.arange(rotary_dim // 2, dtype=high_precision)
 
-        # A set of frequencies evenly spaced in log space
-        freq = base ** (dim / (rotary_dim / 2))
+        # Llama-3.1 uses NTK-by-Parts Rotary Embedding introduced in Section 3.2 in https://arxiv.org/pdf/2309.00071
+        # Implementation copied from https://github.com/huggingface/transformers/blob/v4.46.0/src/transformers/modeling_rope_utils.py#L310
+        if self.cfg.use_NTK_by_parts_rope:
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, rotary_dim, 2, dtype=torch.int64).float() / rotary_dim)
+            )
+            factor = self.cfg.NTK_by_parts_factor
+            low_freq_factor = self.cfg.NTK_by_parts_low_freq_factor
+            high_freq_factor = self.cfg.NTK_by_parts_high_freq_factor
+            old_context_len = n_ctx
+
+            low_freq_wavelen = old_context_len / low_freq_factor
+            high_freq_wavelen = old_context_len / high_freq_factor
+
+            wavelen = 2 * math.pi / inv_freq
+            inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+            smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
+                high_freq_factor - low_freq_factor
+            )
+            smoothed_inv_freq = (
+                1 - smooth_factor
+            ) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+            is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+            inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+            freq = 1 / inv_freq_llama
+        else:
+            freq = base ** (dim / (rotary_dim / 2))
         if self.cfg.rotary_adjacent_pairs:
             freq = einops.repeat(freq, "d -> (d 2)")
         else:
@@ -529,6 +558,10 @@ class AbstractAttention(ABC, nn.Module):
         attention_mask: Optional[Int[torch.Tensor, "batch offset_pos"]] = None,
     ) -> Float[torch.Tensor, "batch pos head_index d_head"]:
         # Only apply rotary to first rotary_dim dimensions (eg, if rotary_dim=64 and d_head=256, only apply to first 1/4 of dimensions)
+
+        if x.device != self.rotary_sin.device:
+            x = x.to(self.rotary_sin.device)
+
         x_pos = x.size(1)
         x_rot = x[..., : self.cfg.rotary_dim]
         x_pass = x[..., self.cfg.rotary_dim :]
@@ -676,7 +709,11 @@ class AbstractAttention(ABC, nn.Module):
             n_heads, device
         )
 
-        # The ALiBi bias is then m * slope_matrix
-        alibi_bias = torch.einsum("ij,k->kij", slope, multipliers)
+        # Add singleton dimensions to make shapes compatible for broadcasting:
+        slope = einops.rearrange(slope, "query key -> 1 query key")
+        multipliers = einops.rearrange(multipliers, "head_idx -> head_idx 1 1")
+
+        # Element-wise multiplication of the slope and multipliers
+        alibi_bias = multipliers * slope
 
         return alibi_bias

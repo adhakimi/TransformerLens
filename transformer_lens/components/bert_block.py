@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 from jaxtyping import Float
 
-from transformer_lens.components import MLP, Attention, LayerNorm
+from transformer_lens.components import Attention, LayerNorm
+from transformer_lens.factories.mlp_factory import MLPFactory
 from transformer_lens.hook_points import HookPoint
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
 from transformer_lens.utils import repeat_along_head_dimension
@@ -25,7 +26,7 @@ class BertBlock(nn.Module):
 
         self.attn = Attention(cfg)
         self.ln1 = LayerNorm(cfg)
-        self.mlp = MLP(cfg)
+        self.mlp = MLPFactory.create_mlp(self.cfg)
         self.ln2 = LayerNorm(cfg)
 
         self.hook_q_input = HookPoint()  # [batch, pos, n_heads, d_model]
@@ -44,7 +45,7 @@ class BertBlock(nn.Module):
         self,
         resid_pre: Float[torch.Tensor, "batch pos d_model"],
         additive_attention_mask: Optional[Float[torch.Tensor, "batch 1 1 pos"]] = None,
-    ):
+    ) -> Float[torch.Tensor, "batch pos d_model"]:
         resid_pre = self.hook_resid_pre(resid_pre)
 
         query_input = resid_pre
