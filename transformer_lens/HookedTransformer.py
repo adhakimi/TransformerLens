@@ -1431,7 +1431,7 @@ class HookedTransformer(HookedRootModule):
             center_unembed=center_unembed,
             fold_value_biases=fold_value_biases,
             refactor_factored_attn_matrices=refactor_factored_attn_matrices,
-            refactor_glu=False
+            refactor_glu=False,
             dtype=dtype,
             default_prepend_bos=default_prepend_bos,
             default_padding_side=default_padding_side,
