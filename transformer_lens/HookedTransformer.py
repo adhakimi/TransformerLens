@@ -1127,6 +1127,7 @@ class HookedTransformer(HookedRootModule):
         center_writing_weights: bool = True,
         center_unembed: bool = True,
         refactor_factored_attn_matrices: bool = False,
+        refactor_glu: bool = False,
         checkpoint_index: Optional[int] = None,
         checkpoint_value: Optional[int] = None,
         hf_model: Optional[Any] = None,
@@ -1218,6 +1219,8 @@ class HookedTransformer(HookedRootModule):
                 keepdim=True)``.
             refactor_factored_attn_matrices: Whether to convert the factored
                 matrices (W_Q & W_K, and W_O & W_V) to be "even". Defaults to False
+            refactor_glu: Whether to adapt the signs of w_in and w_out vectors of neurons such that w_in has a non-negative similarity to w_gate.
+                Only applicable if the model uses a GLU variant (such as SwiGLU). Defaults to False
             checkpoint_index: If loading from a checkpoint, the index of
                 the checkpoint to load.
             checkpoint_value: If loading from a checkpoint, the value of
@@ -1391,6 +1394,7 @@ class HookedTransformer(HookedRootModule):
             center_unembed=center_unembed,
             fold_value_biases=fold_value_biases,
             refactor_factored_attn_matrices=refactor_factored_attn_matrices,
+            refactor_glu=refactor_glu,
         )
 
         if move_to_device:
@@ -1409,6 +1413,7 @@ class HookedTransformer(HookedRootModule):
         center_unembed=False,
         refactor_factored_attn_matrices=False,
         fold_value_biases=False,
+        refactor_glu=False,
         dtype=torch.float32,
         default_prepend_bos=None,
         default_padding_side="right",
@@ -1426,6 +1431,7 @@ class HookedTransformer(HookedRootModule):
             center_unembed=center_unembed,
             fold_value_biases=fold_value_biases,
             refactor_factored_attn_matrices=refactor_factored_attn_matrices,
+            refactor_glu=False
             dtype=dtype,
             default_prepend_bos=default_prepend_bos,
             default_padding_side=default_padding_side,
@@ -1565,6 +1571,7 @@ class HookedTransformer(HookedRootModule):
         center_unembed: bool = True,
         fold_value_biases: bool = True,
         refactor_factored_attn_matrices: bool = False,
+        refactor_glu: bool = False,
     ):
         """Load & Process State Dict.
 
@@ -1591,6 +1598,8 @@ class HookedTransformer(HookedRootModule):
                 make it easier to interpret the head's output.
             refactor_factored_attn_matrices (bool, optional): Whether to convert the factored
                 matrices (W_Q & W_K, and W_O & W_V) to be "even". Defaults to False.
+            refactor_glu: Whether to adapt the signs of w_in and w_out vectors of neurons such that w_in has a non-negative similarity to w_gate.
+                Only applicable if the model uses a GLU variant (such as SwiGLU). Defaults to False
             model_name (str, optional): checks the model name for special cases of state dict
                 loading. Only used for Redwood 2L model currently.
         """
@@ -1647,6 +1656,8 @@ class HookedTransformer(HookedRootModule):
             state_dict = self.fold_value_biases(state_dict)
         if refactor_factored_attn_matrices:
             state_dict = self.refactor_factored_attn_matrices(state_dict)
+        if refactor_glu:
+            state_dict = self.refactor_glu(state_dict)
 
         if self.cfg.load_in_4bit:
             # with quantization, parameters should be assigned
@@ -2006,6 +2017,24 @@ class HookedTransformer(HookedRootModule):
             state_dict[f"blocks.{l}.attn.W_V"] = U @ S.diag_embed()
             state_dict[f"blocks.{l}.attn.W_O"] = utils.transpose(Vh)
 
+        return state_dict
+    
+    def refactor_glu(self, state_dict: Dict[str, torch.Tensor]):
+        """Adapt the signs of w_in and w_out vectors of neurons such that w_in has a non-negative similarity to w_gate.
+        Only applicable if the model uses a GLU variant (such as SwiGLU), aka gated MLPs.
+        Gives a warning otherwise.
+
+        Args:
+            state_dict (Dict[str, torch.Tensor]): The current state dict
+            
+        Returns: new state_dict
+        """
+        if not self.cfg.gated_mlp:#TODO should also warn in the case of bilinear MLPs
+            logging.warning("Attempting to refactor gated MLP weights, but in this model MLPs are not gated. Skipping...")
+        for l in range(self.cfg.n_layers):
+            sign_to_adapt = torch.sign(state_dict[f'blocks.{l}.mlp.W_gate'] * state_dict[f'blocks.{l}.mlp.W_in'])
+            state_dict[f'blocks.{l}.mlp.W_in'] *= sign_to_adapt
+            state_dict[f'blocks.{l}.mlp.W_out'] *= sign_to_adapt
         return state_dict
 
     def set_use_attn_result(self, use_attn_result: bool):
