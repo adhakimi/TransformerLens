@@ -2020,9 +2020,10 @@ class HookedTransformer(HookedRootModule):
             state_dict[f"blocks.{l}.attn.W_O"] = utils.transpose(Vh)
 
         return state_dict
-    
+
     def refactor_glu(self, state_dict: Dict[str, torch.Tensor]):
-        """Adapt the signs of w_in and w_out vectors of neurons such that w_in has a non-negative similarity to w_gate.
+        """Adapt the signs of w_in and w_out vectors of neurons
+        such that w_in has a non-negative similarity to w_gate.
         Only applicable if the model uses a GLU variant (such as SwiGLU), aka gated MLPs.
         Gives a warning otherwise.
 
@@ -2037,11 +2038,12 @@ class HookedTransformer(HookedRootModule):
                 "but in this model MLPs are not gated. Skipping..."
             )
         for l in range(self.cfg.n_layers):
-            sign_to_adapt = torch.sign(
-                state_dict[f'blocks.{l}.mlp.W_gate'] * state_dict[f'blocks.{l}.mlp.W_in']
-            )
-            state_dict[f'blocks.{l}.mlp.W_in'] *= sign_to_adapt
-            state_dict[f'blocks.{l}.mlp.W_out'] *= sign_to_adapt
+            sign_to_adapt = torch.sign(einops.einsum(
+                state_dict[f'blocks.{l}.mlp.W_gate'], state_dict[f'blocks.{l}.mlp.W_in'],
+                "d n, d n -> n"
+            ))
+            state_dict[f'blocks.{l}.mlp.W_in'] *= sign_to_adapt.unsqueeze(0)
+            state_dict[f'blocks.{l}.mlp.W_out'] *= sign_to_adapt.unsqueeze(1)
         return state_dict
 
     def set_use_attn_result(self, use_attn_result: bool):
